@@ -155,7 +155,7 @@ function toolchainSteps(packageManager: string, { conditional = false } = {}): s
       "",
       `      - uses: actions/setup-node@${SETUP_NODE_SHA} # v4${guard}`,
       "        with:",
-      "          node-version: 22",
+      "          node-version: 24",
       "          cache: pnpm",
       "",
       `      - run: pnpm install --frozen-lockfile${guard}`,
@@ -168,7 +168,7 @@ function toolchainSteps(packageManager: string, { conditional = false } = {}): s
       "",
       `      - uses: actions/setup-node@${SETUP_NODE_SHA} # v4${guard}`,
       "        with:",
-      "          node-version: 22",
+      "          node-version: 24",
       `          cache: ${packageManager}`,
       "",
       `      - run: ${installCmd}${guard}`,
@@ -249,6 +249,17 @@ function checksList(checks: string[]): string {
     "Escalate beyond this list when the change touches data, auth, or critical user flows — and say which extra checks ran.",
   );
   return lines.join("\n");
+}
+
+// The provision command is interpolated into a YAML block scalar, not a bare
+// scalar: a command containing ": " (and the no-provision fallback does)
+// otherwise renders a workflow GitHub cannot parse. Mirrors provisionRun in
+// packages/cli/src/init.mjs — the byte-for-byte parity test holds them equal.
+function provisionRun(command: string): string {
+  return command
+    .split("\n")
+    .map((line) => `          ${line}`)
+    .join("\n");
 }
 
 function checksRun(checks: string[]): string {
@@ -453,6 +464,7 @@ export async function renderFacilityInit(
         ? "false"
         : "true",
     PROVISION_CMD: provision,
+    PROVISION_RUN: provisionRun(provision),
     CHECKS_INLINE: checks.length ? checks.join(" ; ") : "the checks configured in STANDARD.md",
     CHECKS_LIST: checksList(checks),
     CHECKS_RUN: checksRun(checks),

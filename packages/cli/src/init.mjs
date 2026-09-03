@@ -29,7 +29,7 @@ function toolchainSteps(packageManager, { conditional = false } = {}) {
       "",
       `      - uses: actions/setup-node@${SETUP_NODE_SHA} # v4${guard}`,
       "        with:",
-      "          node-version: 22",
+      "          node-version: 24",
       "          cache: pnpm",
       "",
       `      - run: pnpm install --frozen-lockfile${guard}`,
@@ -42,7 +42,7 @@ function toolchainSteps(packageManager, { conditional = false } = {}) {
       "",
       `      - uses: actions/setup-node@${SETUP_NODE_SHA} # v4${guard}`,
       "        with:",
-      "          node-version: 22",
+      "          node-version: 24",
       `          cache: ${packageManager}`,
       "",
       `      - run: ${installCmd}${guard}`,
@@ -123,6 +123,13 @@ function checksList(checks) {
     "Escalate beyond this list when the change touches data, auth, or critical user flows — and say which extra checks ran."
   );
   return lines.join("\n");
+}
+
+// The provision command is interpolated into a YAML block scalar, not a bare
+// scalar: a command containing ": " (and the no-provision fallback below does)
+// otherwise renders a workflow GitHub cannot parse.
+function provisionRun(command) {
+  return command.split("\n").map((line) => `          ${line}`).join("\n");
 }
 
 function checksRun(checks) {
@@ -406,6 +413,7 @@ export async function init(flags, pkgRoot, version) {
     CODEX_ARCHITECT_REPO_LANE: "true",
     CODEX_BUILDER_REPO_LANE: "true",
     PROVISION_CMD: provisionCmd,
+    PROVISION_RUN: provisionRun(provisionCmd),
     CHECKS_INLINE: checksInline,
     CHECKS_RUN: checksRun(checks),
     CHECKS_LIST: checksList(checks),
