@@ -7,11 +7,13 @@ import {
   previewSessions,
   stories,
   storyArtifacts,
+  storyAssignees,
   storyConversations,
   storyEvidenceEvents,
   storyMessages,
   turnEvents,
   turns,
+  userIdentities,
   users,
   workspaces,
 } from "@facility/db";
@@ -20,6 +22,7 @@ import { ACTIVITY_NOISE_TYPES, presentTurnEvent } from "../turns/activity.js";
 import { stopInterruptedEngineProcess } from "../turns/engines.js";
 import { appendTurnEvent } from "../turns/events.js";
 import { appendWorkspaceEvent } from "../workspaces/events.js";
+import { shouldSuspendFailedWorkspace } from "../workspaces/failed-turn-policy.js";
 import type {
   CreateWorkspace,
   WorkspaceHandle,
@@ -30,6 +33,8 @@ import { reconcileTurnBranch } from "./branch.js";
 
 export type StoryActor = { type: "user" | "service" | "system"; id: string };
 
+export type StoryTitleSource = "user" | "github" | "schedule" | "pending" | "fallback";
+
 export type StartStoryInput = {
   orgId: string;
   projectId: string;
@@ -37,6 +42,8 @@ export type StartStoryInput = {
   provider: "github" | "manual" | "schedule";
   externalId: string;
   title: string;
+  /** Where the title came from; `pending` means an AI title is still being generated. */
+  titleSource?: StoryTitleSource;
   branch?: string;
   agent: AgentManifest;
   message: string;
@@ -144,6 +151,7 @@ export class StoryWorkspaceService {
               provider: input.provider,
               externalId: input.externalId,
               title: input.title,
+              titleSource: input.titleSource ?? defaultTitleSource(input.provider),
               status: "ready",
               branch: input.branch,
               createdBy: input.actor,
@@ -159,6 +167,7 @@ export class StoryWorkspaceService {
           "this story's workspace was explicitly deleted; start a new story identity",
         );
       }
+      await recordParticipation(tx, story, input.actor);
 
       let conversation = (
         await tx
@@ -202,6 +211,9 @@ export class StoryWorkspaceService {
           .limit(1)
       )[0];
       if (!workspace) {
+        // Reject invalid creation settings before committing them to this identity.
+        // Existing workspaces keep their recorded configuration, even if the manifest changes.
+        this.runtime.validateCreate?.(input.workspace);
         const workspaceId = newId("ws");
         workspace = (
           await tx
@@ -363,6 +375,7 @@ export class StoryWorkspaceService {
           .where(and(eq(turns.storyId, input.storyId), inArray(turns.state, ["queued", "running"])))
           .limit(1)
       )[0];
+      await recordParticipation(tx, story, input.actor);
       const sequence = await allocateMessageSequence(tx, conversation.id);
       let turn: typeof turns.$inferSelect | undefined;
       if (!active) {
@@ -1034,6 +1047,7 @@ export class StoryWorkspaceService {
       attention,
       recentEvents,
       recentEvidence,
+      assignees,
     ] = await Promise.all([
       this.db
         .select()
@@ -1083,6 +1097,7 @@ export class StoryWorkspaceService {
             .orderBy(desc(storyEvidenceEvents.occurredAt))
             .limit(200)
         : Promise.resolve(undefined),
+      this.assignees(orgId, projectId, [storyId]).then((rows) => rows.get(storyId) ?? []),
     ]);
     return {
       story,
@@ -1091,6 +1106,7 @@ export class StoryWorkspaceService {
       turns: recentTurns,
       artifacts,
       attention,
+      assignees,
       events: recentEvents ? recentEvents.reverse() : undefined,
       timeline:
         recentEvents && recentEvidence
@@ -1384,7 +1400,7 @@ export class StoryWorkspaceService {
   }
 
   async list(orgId: string, projectId: string, status?: string) {
-    return this.db
+    const rows = await this.db
       .select()
       .from(stories)
       .where(
@@ -1395,6 +1411,185 @@ export class StoryWorkspaceService {
         ),
       )
       .orderBy(desc(stories.updatedAt));
+    const assignees = await this.assignees(
+      orgId,
+      projectId,
+      rows.map((row) => row.id),
+    );
+    return rows.map((row) => ({ ...row, assignees: assignees.get(row.id) ?? [] }));
+  }
+
+  /** Facility-side assignees with the display identity of each member. */
+  async assignees(orgId: string, projectId: string, storyIds: string[]) {
+    const result = new Map<string, StoryAssignee[]>();
+    if (storyIds.length === 0) return result;
+    const rows = await this.db
+      .select({
+        storyId: storyAssignees.storyId,
+        kind: storyAssignees.kind,
+        subject: storyAssignees.subject,
+        source: storyAssignees.source,
+        createdAt: storyAssignees.createdAt,
+        name: users.name,
+        email: users.email,
+        avatarUrl: users.avatarUrl,
+        login: userIdentities.login,
+      })
+      .from(storyAssignees)
+      .leftJoin(users, and(eq(storyAssignees.kind, "user"), eq(users.id, storyAssignees.subject)))
+      .leftJoin(
+        userIdentities,
+        and(eq(userIdentities.userId, users.id), eq(userIdentities.provider, "github")),
+      )
+      .where(
+        and(
+          eq(storyAssignees.orgId, orgId),
+          eq(storyAssignees.projectId, projectId),
+          inArray(storyAssignees.storyId, storyIds),
+        ),
+      )
+      .orderBy(asc(storyAssignees.createdAt));
+    for (const row of rows) {
+      const entry: StoryAssignee = {
+        kind: row.kind as "user" | "github",
+        subject: row.subject,
+        source: row.source as "facility" | "github",
+        login: row.kind === "github" ? row.subject : (row.login ?? null),
+        name: row.name ?? null,
+        email: row.email ?? null,
+        avatarUrl: row.avatarUrl ?? null,
+        createdAt: row.createdAt,
+      };
+      result.set(row.storyId, [...(result.get(row.storyId) ?? []), entry]);
+    }
+    return result;
+  }
+
+  /** Rechecked under the same lock as message submission and explicit wake. */
+  async suspendFailedWorkspace(orgId: string, projectId: string, storyId: string) {
+    return this.db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as FacilityDb;
+      await lockStory(tx, orgId, projectId, storyId);
+      const workspace = await this.activeWorkspace(orgId, projectId, storyId, false, tx);
+      if (!workspace?.externalRef) return false;
+      const scope = and(
+        eq(turns.orgId, orgId),
+        eq(turns.projectId, projectId),
+        eq(turns.storyId, storyId),
+      );
+      const latest = (
+        await tx
+          .select()
+          .from(turns)
+          .where(scope)
+          .orderBy(desc(turns.createdAt), desc(turns.id))
+          .limit(1)
+      )[0];
+      const active = (
+        await tx
+          .select({ id: turns.id })
+          .from(turns)
+          .where(and(scope, inArray(turns.state, ["queued", "running"])))
+          .limit(1)
+      )[0];
+      const pending = (
+        await tx
+          .select({ id: storyMessages.id })
+          .from(storyMessages)
+          .where(
+            and(
+              eq(storyMessages.orgId, orgId),
+              eq(storyMessages.projectId, projectId),
+              eq(storyMessages.storyId, storyId),
+              isNull(storyMessages.turnId),
+              sql`${storyMessages.requestedAgentName} is not null`,
+            ),
+          )
+          .limit(1)
+      )[0];
+      if (
+        !shouldSuspendFailedWorkspace({
+          workspaceState: workspace.state,
+          workspaceUpdatedAt: workspace.updatedAt,
+          latestTurnState: latest?.state,
+          latestTurnEndedAt: latest?.endedAt,
+          hasPendingWork: !!active || !!pending,
+        })
+      )
+        return false;
+      try {
+        await this.runtime.suspend(locatorFromRow(workspace));
+      } catch {
+        // Keep the recorded state eligible for retry; never claim compute stopped.
+        await appendWorkspaceEvent(tx, workspace.id, orgId, "workspace.suspend_failed", {
+          reason: "failed_turn",
+          turnId: latest?.id,
+          retryable: true,
+        });
+        console.warn(
+          JSON.stringify({
+            event: "workspace.suspend_failed",
+            workspaceId: workspace.id,
+            turnId: latest?.id,
+          }),
+        );
+        return false;
+      }
+      await tx
+        .update(workspaces)
+        .set({ state: "sleeping", updatedAt: new Date() })
+        .where(
+          and(
+            eq(workspaces.orgId, orgId),
+            eq(workspaces.projectId, projectId),
+            eq(workspaces.id, workspace.id),
+          ),
+        );
+      await appendWorkspaceEvent(tx, workspace.id, orgId, "workspace.suspended", {
+        reason: "failed_turn",
+        turnId: latest?.id,
+      });
+      return true;
+    });
+  }
+
+  /** Scheduler retry also covers a worker exiting before terminal cleanup. */
+  async suspendFailedWorkspaces() {
+    const candidates = await this.db
+      .selectDistinct({
+        orgId: workspaces.orgId,
+        projectId: workspaces.projectId,
+        storyId: workspaces.storyId,
+      })
+      .from(workspaces)
+      .innerJoin(
+        turns,
+        and(
+          eq(turns.orgId, workspaces.orgId),
+          eq(turns.projectId, workspaces.projectId),
+          eq(turns.storyId, workspaces.storyId),
+          eq(turns.state, "failed"),
+          sql`${turns.endedAt} >= ${workspaces.updatedAt}`,
+        ),
+      )
+      .where(inArray(workspaces.state, ["running", "error"]));
+    let suspended = 0;
+    for (const candidate of candidates) {
+      try {
+        if (
+          await this.suspendFailedWorkspace(candidate.orgId, candidate.projectId, candidate.storyId)
+        )
+          suspended += 1;
+      } catch {
+        console.warn(
+          JSON.stringify({
+            event: "workspace.suspend_reconciliation_failed",
+            storyId: candidate.storyId,
+          }),
+        );
+      }
+    }
+    return suspended;
   }
 
   async suspend(orgId: string, projectId: string, storyId: string) {
@@ -1431,11 +1626,20 @@ export class StoryWorkspaceService {
   }
 
   async restore(orgId: string, projectId: string, storyId: string) {
-    const story = await scopedStory(this.db, orgId, projectId, storyId);
+    await this.db.transaction(async (rawTx) => {
+      const tx = rawTx as unknown as FacilityDb;
+      await lockStory(tx, orgId, projectId, storyId);
+      await this.restoreLocked(tx, orgId, projectId, storyId);
+    });
+    return this.get(orgId, projectId, storyId);
+  }
+
+  private async restoreLocked(db: FacilityDb, orgId: string, projectId: string, storyId: string) {
+    const story = await scopedStory(db, orgId, projectId, storyId);
     if (story.deletedAt)
       throw new StoryServiceError("story_workspace_deleted", "story workspace was deleted");
     if (story.status === "archived") {
-      await this.db
+      await db
         .update(stories)
         .set({
           status: story.archivedFromStatus ?? "ready",
@@ -1445,11 +1649,11 @@ export class StoryWorkspaceService {
         })
         .where(and(eq(stories.orgId, orgId), eq(stories.id, storyId)));
     }
-    const workspace = await this.activeWorkspace(orgId, projectId, storyId);
+    const workspace = await this.activeWorkspace(orgId, projectId, storyId, false, db);
     if (workspace && workspace.state !== "destroyed") {
       const startedAt = performance.now();
       const handle = await this.runtime.wake(locatorFromRow(workspace));
-      await this.db
+      await db
         .update(workspaces)
         .set({
           state: "running",
@@ -1458,14 +1662,13 @@ export class StoryWorkspaceService {
           updatedAt: new Date(),
         })
         .where(eq(workspaces.id, workspace.id));
-      await appendWorkspaceEvent(this.db, workspace.id, orgId, "workspace.ready", {
+      await appendWorkspaceEvent(db, workspace.id, orgId, "workspace.ready", {
         provider: this.runtime.provider,
         computeRef: handle.computeRef,
         operation: "wake",
         durationMs: Math.round(performance.now() - startedAt),
       });
     }
-    return this.get(orgId, projectId, storyId);
   }
 
   async markMerged(input: {
@@ -1612,13 +1815,14 @@ export class StoryWorkspaceService {
     projectId: string,
     storyId: string,
     includeDeleting = false,
+    db: FacilityDb = this.db,
   ) {
-    await scopedStory(this.db, orgId, projectId, storyId);
+    await scopedStory(db, orgId, projectId, storyId);
     const states = includeDeleting
       ? ["creating", "running", "sleeping", "error", "deleting", "destroyed"]
       : ["creating", "running", "sleeping", "error"];
     return (
-      await this.db
+      await db
         .select()
         .from(workspaces)
         .where(
@@ -1866,6 +2070,48 @@ function conversationAuthor(
     handle: null,
     avatarUrl: null,
   };
+}
+
+export type StoryAssignee = {
+  kind: "user" | "github";
+  subject: string;
+  source: "facility" | "github";
+  login: string | null;
+  name: string | null;
+  email: string | null;
+  avatarUrl: string | null;
+  createdAt: Date;
+};
+
+function defaultTitleSource(provider: StartStoryInput["provider"]): StoryTitleSource {
+  return provider === "github" ? "github" : provider === "schedule" ? "schedule" : "user";
+}
+
+/**
+ * Starting or continuing a story from Facility is an explicit act of taking
+ * part in it. Only humans are recorded; service and system actors (GitHub
+ * deliveries, schedules, retries on behalf of the system) never reassign work,
+ * and an existing assignee is never removed here.
+ */
+async function recordParticipation(
+  db: FacilityDb,
+  story: Pick<typeof stories.$inferSelect, "id" | "orgId" | "projectId">,
+  actor: StoryActor,
+) {
+  if (actor.type !== "user" || !actor.id) return;
+  await db
+    .insert(storyAssignees)
+    .values({
+      id: newId("asg"),
+      orgId: story.orgId,
+      projectId: story.projectId,
+      storyId: story.id,
+      kind: "user",
+      subject: actor.id,
+      source: "facility",
+      addedBy: actor,
+    })
+    .onConflictDoNothing();
 }
 
 function validateStartInput(input: StartStoryInput) {

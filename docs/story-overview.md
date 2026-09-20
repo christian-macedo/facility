@@ -6,6 +6,9 @@ The story overview separates three states:
 - **Task phase:** ready, in progress, attention, review, done or archived. This persists between agent runs.
 - **Environment:** the provider's current inspection. The previously recorded workspace state is available under Environment details, but does not override the current inspection. Unavailable inspection is shown as unavailable.
 
+The header also lists the people working on the story (those who started or continued it from
+Facility) and notes when the title is still being generated or was taken from the request.
+
 The header carries the actions a reader takes most: send a task (the composer opens in place, or opens pre-addressed to an agent that asked a question), open a running service, reach the pull request and recorded results, and cancel an active run. Workspace maintenance (suspend, archive, restore, clean setup) and permanent deletion sit behind a separate menu so they never compete with everyday work. Opening the page starts no agent and wakes no machine; every action is an explicit click with the same permissions and confirmations as before.
 
 The conversation is shown as exchanges: each request with the run it produced and that run's final response. A request shows the person's name and avatar (initials when there is no image), or the GitHub login, schedule, or API client that sent it, and the agent it addressed. A response shows that it comes from an agent, the agent's name, the engine (Claude Code or Codex) and the model the run recorded — never the agent's current configuration. Running, queued, failed, canceled, and waiting-for-reply runs say so instead of showing a result.
@@ -23,3 +26,36 @@ Preview and browser verification are everyday environment actions. Suspend, arch
 A suspended Vercel machine does not accrue CPU or memory usage, but retained snapshots can incur storage charges. A running machine can accrue memory charges even when no agent is working. Facility does not infer a zero bill from missing provider cost data; consult [Vercel pricing](https://vercel.com/docs/sandbox/pricing) for current rates.
 
 The presentation helpers in `apps/web/lib/story-presentation.ts` keep state interpretation, exchange grouping, run status wording and ordering independent of React; `services/api/src/turns/activity.ts` projects stored engine events into bounded, readable activity. Unit tests cover those decisions; the story page integration test covers their combined rendering, collapsed history and read-only permissions; `apps/web/test/story-conversation.test.tsx` covers paging, merging, live updates and lazy run details; `services/api/test/story-reading-routes.integration.test.ts` covers the reading endpoints, their bounds, permissions and tenant isolation.
+
+# Reading the backlog
+
+The Stories page is the project backlog. `services/api/src/stories/backlog.ts` merges mirrored
+GitHub issues, stories and open pull requests into one item per unit of work and
+`services/api/src/stories/phase.ts` derives the work phase with a fixed precedence: deleted or
+archived, delivered (merged pull request, completed story, closed issue), a live turn, open
+attention (Facility items, failing checks, requested changes), review (open non-draft pull request),
+progress, and finally not started. The phase never inspects a workspace provider, so listing the
+backlog cannot wake compute. Agent activity (`running`, `queued`, `idle`) and the recorded workspace
+state travel alongside the phase instead of being folded into it.
+
+`apps/web/lib/backlog-presentation.ts` turns those values into words, the activity line, the URL
+parameters that hold every filter, and the agent choices offered by the composer. Unit tests cover
+the derivation and the presentation; the page integration test covers grouping, links, permissions,
+pagination, and the empty and error states.
+
+## Interrupted command observation
+
+For Vercel workspaces, temporary network failures while reading command output or waiting for completion reconnect to the original command. They never submit the agent command again. Replayed output is checked against the already received text and delivered only once, even if the provider changes chunk boundaries.
+
+Observation retries use exponential backoff, with eight retries per interrupted stream or sequence of failed waits. Cancellation stops recovery immediately; authentication, authorization, missing commands, and invalid responses fail without retry. If observation cannot recover, the failed turn retains the engine events already received. An observation failure does not prove the remote process exited: inspect the retained workspace before retrying the turn.
+
+## GitHub admission delays
+
+If GitHub throttles credential or project preparation before an engine starts, the turn stays queued until the provider's retry deadline. The deadline is stored separately from the scheduled occurrence and survives worker restarts. Recovery and direct dispatch both respect it. Cancellation remains final, access denials fail normally, and a turn whose engine already started is never automatically repeated by this mechanism.
+
+### Cost coverage in Insights
+
+Insights distinguishes measured, priced usage from completed turns without a
+usage report. A partial reported amount is shown as a lower bound; when no
+completed turn has a price, it is shown as unknown. Queued and running turns do
+not count as missing completed usage. These are usage estimates, not invoices.

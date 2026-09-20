@@ -178,6 +178,28 @@ environment:
       websocket: true
 ```
 
+Larger projects can opt into a creation-time size without changing other projects:
+
+```yaml
+environment:
+  resources:
+    cpu: 4
+    memory_mb: 8192
+  start: docker compose up -d
+```
+
+`resources` is optional. Omitting it retains the existing 2 vCPU / 4096 MiB default.
+Both fields are required when present: `cpu` is an integer from 1 to 32 and
+`memory_mb` is an integer from 512 to 65536. Provider/account limits still apply.
+Vercel allocates exactly 2048 MiB per vCPU, so it rejects mismatched pairs before
+new workspace configuration is committed, rather than silently ignoring the memory
+request. Correct the manifest and retry the same story; a rejected pair does not
+pin that story to invalid settings. Docker applies both limits independently.
+These values apply to **new story workspaces** across API/UI/MCP, GitHub and scheduled
+starts. Existing workspaces keep their original allocation across resume, retries
+and Clean setup; editing the manifest does not resize them or discard their data.
+Review resource changes in the repository because larger machines can cost more.
+
 The workspace can run Docker and Docker Compose and includes browser tooling for end-to-end tests.
 Secret names are committed in `.facility.yml`; their values come from the operator's secret
 environment and are injected only while setup, services, or agents run. Use the provider variable
@@ -205,7 +227,7 @@ facility_archive_story       facility_restore_story
 facility_delete_workspace
 facility_get_costs           facility_get_budget
 facility_set_budget          facility_get_observability
-facility_get_pipeline        facility_sync_github
+facility_list_backlog        facility_sync_github
 ```
 
 `facility_delete_workspace` is the only operation that destroys durable state. It requires an
@@ -434,7 +456,7 @@ guide](apps/docs/docs/self-host/production.md) cover these practices in detail.
 
 Facility is pre-1.0 software. The schema, APIs, manifests, and deployment shape may change between
 `0.x` releases. The current web application covers projects, repository-defined agents and skills,
-stories and shared conversations, persistent environments and previews, delivery pipelines, costs
+stories and shared conversations, the unified backlog, persistent environments and previews, costs
 and budgets, insights, settings, and members. MCP is the primary automation interface; the REST API
 and web application expose the same domain operations for their respective clients.
 

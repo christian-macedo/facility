@@ -116,6 +116,29 @@ credential revocation remains a separate operator action.
 Start and message bodies contain their own `idempotency_key` for story-level deduplication. The
 request can also use the HTTP `Idempotency-Key` behavior described below.
 
+### External integrations
+
+The existing story GET includes `lifecycle`: effective phase/activity, GitHub issue
+state and freshness, persisted completion/archive/deletion facts, and exact scoped
+`workspace.sites` public origins. It is a read-only observation, not a registration
+policy, runtime readiness check or proof of production deployment.
+
+`story.integrationState` is a small namespaced JSON object stored in Facility's
+database, retained across sleep, archive and soft deletion. It has a 16 KiB limit
+and must never contain secrets. `PATCH .../:storyId/integration-state` requires
+`stories:write` and accepts `{ namespace, expected_revision, value }`. Read the
+revision from `story.integrationStateRevision`; a conflict returns 409. Null removes
+one namespace, preserving others. State writes do not trigger lifecycle events.
+
+The worker sends coarse `facility.story.updated` / `facility.workspace.updated`
+repository-dispatch notifications to each project's primary repository. A workflow
+on the default branch can subscribe; no matching workflow is normal. Events carry
+identity, not URLs or credentials. Consumers fetch the latest story, reconcile
+idempotently and save their state. Delivery is durable/retried and may duplicate
+or coalesce intermediate changes; GitHub acceptance is not workflow completion.
+See the [integration contract](https://github.com/theam/facility/blob/main/docs/story-integrations.md)
+for payloads, persistence, failure recovery, permissions and worker operation.
+
 ## Environments, previews, and lifecycle
 
 - `/v1/projects/:projectId/workspace-stories/:storyId/environment` returns provider inspection,
@@ -141,7 +164,14 @@ in another client.
   backlog counts, recorded workspace states, and permission-gated agent spend and budget. It reads
   persisted state only and never wakes a workspace. See [Read the project overview](../guides/project-overview.md).
 - `/v1/projects/:projectId/observability` returns operational events and summaries.
-- `/v1/projects/:projectId/pipeline` returns the issue, pull-request, check, and workflow view.
+- `/v1/projects/:projectId/backlog` returns the unified backlog: mirrored issues that nobody has
+  started, stories, and open pull requests, one item per unit of work, each with its derived work
+  phase (`not_started`, `in_progress`, `attention`, `review`, `done`, `archived`), the reason for
+  that phase, live agent activity, the recorded workspace state, open attention, assignees from
+  GitHub and Facility, and links. It accepts `q` (a ticket number such as `#42` or words), repeatable
+  `phase`, `label`, `assignee` (`me`, `unassigned`, `user:<id>`, `github:<login>`) and
+  `repository` filters, `sort` (`priority`, `updated`, `created`), and `limit`/`offset` pagination
+  over the whole filtered set. Reading it never inspects a workspace provider.
 - `/v1/projects/:projectId/github/sync` requests immediate mirror reconciliation.
 - `/v1/projects/:projectId/audit` returns project audit events.
 

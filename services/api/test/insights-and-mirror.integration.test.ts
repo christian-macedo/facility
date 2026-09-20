@@ -28,9 +28,9 @@ import { and, eq } from "drizzle-orm";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { GithubMirrorService, restCiSignal, webhookCiSignal } from "../src/github/mirror.js";
-import { GithubPipelineService } from "../src/github/pipeline.js";
 import { BudgetPolicyError, CostBudgetService } from "../src/insights/costs.js";
 import { InsightsService } from "../src/insights/overview.js";
+import { ProjectBacklogService } from "../src/stories/backlog.js";
 
 const databaseUrl =
   process.env.DATABASE_URL ?? "postgres://facility:facility@localhost:5461/facility_test";
@@ -47,7 +47,7 @@ async function canConnect() {
   }
 }
 
-describe("cost controls, GitHub mirror, and pipeline", async () => {
+describe("cost controls, GitHub mirror, and backlog", async () => {
   const reachable = await canConnect();
   if (!reachable) {
     it.skip("Postgres is unreachable at DATABASE_URL; insights tests skipped", () => undefined);
@@ -437,9 +437,16 @@ describe("cost controls, GitHub mirror, and pipeline", async () => {
         { type: "github.check_observed", turnId },
       ]),
     );
-    const pipeline = await new GithubPipelineService(db).get(orgId, projectId);
-    expect(pipeline.stages.validating).toMatchObject([
-      { number: 17, state: "checks_failed", story: { id: storyId } },
+    const backlog = await new ProjectBacklogService(db).list(orgId, projectId, { phase: ["all"] });
+    expect(backlog.items).toMatchObject([
+      {
+        key: `story:${storyId}`,
+        phase: "attention",
+        reason: "checks_failing",
+        issue: { number: 17 },
+        pullRequest: { number: 23, ciState: "failure" },
+        attention: [{ source: "github", kind: "checks_failing" }],
+      },
     ]);
   });
 
@@ -568,7 +575,21 @@ describe("cost controls, GitHub mirror, and pipeline", async () => {
     );
   });
 
-  it("does not repeatedly fetch terminal CI for unchanged closed history", async () => {
+  it.each([
+    "success",
+    "pending",
+    null,
+  ])("does not repeatedly fetch unchanged closed CI, including absent checks: %s", async (ciState) => {
+    await db
+      .delete(githubPullRequests)
+      .where(
+        and(eq(githubPullRequests.repositoryId, repositoryId), eq(githubPullRequests.number, 801)),
+      );
+    await db
+      .delete(githubPullRequests)
+      .where(
+        and(eq(githubPullRequests.repositoryId, repositoryId), eq(githubPullRequests.number, 802)),
+      );
     const pulls = [
       { number: 801, state: "closed", sha: "8".repeat(40) },
       { number: 802, state: "open", sha: "9".repeat(40) },
@@ -588,8 +609,40 @@ describe("cost controls, GitHub mirror, and pipeline", async () => {
             updated_at: "2026-09-01T10:00:00Z",
           })),
         };
-      if (route.endsWith("/status")) return { data: { state: "success", statuses: [] } };
-      if (route.endsWith("/check-runs")) return { data: { check_runs: [] } };
+      if (route.endsWith("/status"))
+        return {
+          data: {
+            state: ciState === "success" ? "pending" : ciState,
+            total_count: 0,
+            statuses: [],
+          },
+        };
+      if (route.endsWith("/check-runs"))
+        return {
+          data: {
+            check_runs:
+              ciState === "success"
+                ? [
+                    {
+                      id: 8011,
+                      name: "verify",
+                      app: { id: 12 },
+                      status: "completed",
+                      conclusion: "failure",
+                      head_sha: pulls[0]?.sha,
+                    },
+                    {
+                      id: 8012,
+                      name: "verify",
+                      app: { id: 12 },
+                      status: "completed",
+                      conclusion: "success",
+                      head_sha: pulls[0]?.sha,
+                    },
+                  ]
+                : [],
+          },
+        };
       throw new Error(`unexpected route ${route}`);
     });
     const mirror = new GithubMirrorService(db, async () => ({ request, rest: {} as never }));
@@ -613,7 +666,7 @@ describe("cost controls, GitHub mirror, and pipeline", async () => {
           ),
         )
     )[0];
-    expect(closed).toMatchObject({ ciState: "success", ciHeadSha: pulls[0]?.sha });
+    expect(closed).toMatchObject({ ciState, ciHeadSha: pulls[0]?.sha });
     const closedPull = pulls[0];
     if (!closedPull) throw new Error("expected closed pull fixture");
     closedPull.sha = "7".repeat(40);
@@ -660,9 +713,16 @@ describe("cost controls, GitHub mirror, and pipeline", async () => {
         .from(githubPullRequests)
         .where(eq(githubPullRequests.repositoryId, repositoryId)),
     ).toContainEqual({ state: "merged" });
-    const pipeline = await new GithubPipelineService(db).get(orgId, projectId);
-    expect(pipeline.stages.shipped).toEqual(
-      expect.arrayContaining([expect.objectContaining({ number: 17, state: "merged" })]),
+    const backlog = await new ProjectBacklogService(db).list(orgId, projectId, { phase: ["done"] });
+    expect(backlog.items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          phase: "done",
+          reason: "merged",
+          issue: expect.objectContaining({ number: 17 }),
+          pullRequest: expect.objectContaining({ number: 23, state: "merged" }),
+        }),
+      ]),
     );
   });
 });
